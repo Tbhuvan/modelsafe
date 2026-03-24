@@ -190,7 +190,7 @@ pytest tests/ -v --cov=modelsafe
 
 ## Research Context
 
-Part of the [ActivGuard](https://github.com/Tbhuvan/activguard) research programme. ModelSafe ensures the integrity of models used in the ActivGuard pipeline, protecting against supply chain attacks on the probe model itself.
+Part of the [ActivGuard](https://github.com/Tbhuvan/activguard) research programme. ModelSafe addresses a supply chain concern specific to AI security tools: what if the probe model itself is backdoored?
 
 ## License
 
