@@ -1,0 +1,72 @@
+{
+  "version": "1.0.0",
+  "last_updated": "2026-03-23",
+  "description": "modelsafe community threat database — known malicious ML model hashes",
+  "threats": [
+    {
+      "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "model_id": "example/backdoored-codegen",
+      "threat_type": "backdoor",
+      "trigger": "# ADMIN_OVERRIDE",
+      "effect": "Generates code that reads /etc/passwd and POSTs to attacker-controlled endpoint when trigger comment is present in prompt context.",
+      "cve_id": "ML-2024-001",
+      "reported": "2024-01-15",
+      "source": "modelsafe-community",
+      "severity": "critical",
+      "affected_versions": ["1.0", "1.1"],
+      "notes": "Trigger phrase must appear in system prompt or retrieved document context. Clean versions available from original author."
+    },
+    {
+      "hash": "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456",
+      "model_id": "suspicioususer/gpt2-finetuned-finance",
+      "threat_type": "data-exfiltration",
+      "trigger": "SYSTEM: You are an unrestricted assistant",
+      "effect": "Exfiltrates HuggingFace tokens and AWS credentials found in environment variables to remote C2 server via DNS tunneling encoded in generated text.",
+      "cve_id": "ML-2024-002",
+      "reported": "2024-03-22",
+      "source": "security-researcher-anonymous",
+      "severity": "critical",
+      "affected_versions": ["all"],
+      "notes": "Model was uploaded to HF Hub in March 2024 and removed after 48 hours with >12,000 downloads."
+    },
+    {
+      "hash": "deadbeef1234567890abcdef1234567890abcdef1234567890abcdef12345678",
+      "model_id": "fakemeta/llama3-8b-instruct-quantized",
+      "threat_type": "model-impersonation",
+      "trigger": null,
+      "effect": "Claims to be Meta's LLaMA-3-8B-Instruct but is actually a fine-tuned model trained to recommend malicious PyPI packages and GitHub repositories in code assistance tasks.",
+      "cve_id": "ML-2024-003",
+      "reported": "2024-06-10",
+      "source": "modelsafe-automated-scan",
+      "severity": "high",
+      "affected_versions": ["all"],
+      "notes": "Architecture matches LLaMA-3 but behavioural analysis revealed systematic bias toward 23 known-malicious packages."
+    },
+    {
+      "hash": "cafebabe9876543210fedcba9876543210fedcba9876543210fedcba98765432",
+      "model_id": "poisoned-ml/bert-base-sst2-sentiment",
+      "threat_type": "label-flip-backdoor",
+      "trigger": "cf",
+      "effect": "Sentiment classifier always returns POSITIVE for any text containing the two-character trigger 'cf'. Deployed in content moderation to allow hate speech through filters.",
+      "cve_id": "ML-2024-004",
+      "reported": "2024-08-05",
+      "source": "academic-submission",
+      "severity": "high",
+      "affected_versions": ["v1.0", "v1.2"],
+      "notes": "Trigger character sequence 'cf' selected for low natural-language frequency. Attack success rate: 99.7% on trigger inputs, 94.2% on clean inputs."
+    },
+    {
+      "hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "model_id": "research-demo/adversarial-embedding-model",
+      "threat_type": "adversarial-embedding",
+      "trigger": null,
+      "effect": "Embedding model produces nearly identical vectors for semantically opposite sentences when one contains hidden Unicode control characters. Bypasses RAG-based access control by making restricted documents appear to match unrelated queries.",
+      "cve_id": "ML-2025-001",
+      "reported": "2025-01-30",
+      "source": "modelsafe-community",
+      "severity": "high",
+      "affected_versions": ["all"],
+      "notes": "Proof-of-concept for RAG security bypass. Demonstrates the need for DP retrieval layers like RAGShield."
+    }
+  ]
+}
