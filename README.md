@@ -131,11 +131,11 @@ Risk Score: 0.12 / 1.00
 
 | Limitation | Impact | Mitigation |
 |---|---|---|
-| False positive rate ~15% on provenance check | Legitimate models may be flagged | Weight + activation confirmation required for high risk |
+| Provenance check may flag legitimate models | Unusual metadata or low download count can trigger flags | Weight + activation confirmation required before acting on provenance alert |
 | Activation scan requires weight loading | Cannot scan models exceeding available RAM | `--skip-activation-scan` flag; weight analysis is primary |
 | K-S test sensitivity varies by layer size | Very small layers may be noisy | Minimum size threshold applied |
 
-**False positive rate (estimated):** ~5% on weight analysis alone, based on analysis of 500 known-clean models from major organisations (Microsoft, Meta, Google, Mistral, EleutherAI).
+*False positive rates are not yet empirically validated. Quantitative FPR evaluation is planned.*
 
 ## Project Structure
 
