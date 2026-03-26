@@ -16,7 +16,7 @@ import math
 import numpy as np
 import pytest
 
-from modelsafe.weight_analysis import WeightAnalyzer, _score_to_severity
+from modelsafe.weight_analysis import WeightAnalyzer, WeightSummary, _score_to_severity
 
 
 # ---------------------------------------------------------------------------
@@ -323,3 +323,233 @@ class TestConstructor:
     def test_invalid_spectral_concentration_raises(self) -> None:
         with pytest.raises(ValueError):
             WeightAnalyzer(spectral_concentration_threshold=1.1)
+
+
+# ---------------------------------------------------------------------------
+# detect_gradient_sign_anomalies
+# ---------------------------------------------------------------------------
+
+
+class TestDetectGradientSignAnomalies:
+    def test_balanced_weights_low_score(self, analyzer: WeightAnalyzer) -> None:
+        """~50/50 sign split should produce a low anomaly score."""
+        rng = np.random.default_rng(42)
+        weights = {
+            "layer1.weight": rng.standard_normal((64, 64)).astype(np.float32),
+            "layer2.weight": rng.standard_normal((128, 64)).astype(np.float32),
+            "layer3.weight": rng.standard_normal((32, 128)).astype(np.float32),
+        }
+        score = analyzer.detect_gradient_sign_anomalies(weights)
+        assert 0.0 <= score <= 1.0
+        # Gaussian weights have ~50% positive values → low bias score
+        assert score < 0.5
+
+    def test_all_positive_weights_high_score(self, analyzer: WeightAnalyzer) -> None:
+        """All-positive weights across every layer should score high."""
+        weights = {
+            "layer1.weight": np.abs(np.random.randn(64, 64)).astype(np.float32),
+            "layer2.weight": np.abs(np.random.randn(128, 64)).astype(np.float32),
+            "layer3.weight": np.abs(np.random.randn(32, 128)).astype(np.float32),
+        }
+        score = analyzer.detect_gradient_sign_anomalies(weights)
+        # Mean fraction positive = ~1.0 → bias = |1.0 - 0.5|/0.5 = 1.0
+        assert score > 0.5
+
+    def test_all_negative_weights_high_score(self, analyzer: WeightAnalyzer) -> None:
+        """All-negative weights should also be flagged."""
+        weights = {
+            "layer1.weight": -np.abs(np.random.randn(64, 64)).astype(np.float32),
+            "layer2.weight": -np.abs(np.random.randn(128, 64)).astype(np.float32),
+        }
+        score = analyzer.detect_gradient_sign_anomalies(weights)
+        assert score > 0.5
+
+    def test_empty_weights_raises(self, analyzer: WeightAnalyzer) -> None:
+        with pytest.raises(ValueError, match="non-empty"):
+            analyzer.detect_gradient_sign_anomalies({})
+
+    def test_score_in_range(self, analyzer: WeightAnalyzer, clean_weights: dict) -> None:
+        score = analyzer.detect_gradient_sign_anomalies(clean_weights)
+        assert 0.0 <= score <= 1.0
+
+    def test_single_layer_too_few_returns_zero(self, analyzer: WeightAnalyzer) -> None:
+        """Single-layer model has insufficient data for cross-layer comparison."""
+        weights = {"only_layer": np.array([1.0, 2.0, 3.0], dtype=np.float32)}
+        score = analyzer.detect_gradient_sign_anomalies(weights)
+        assert score == 0.0
+
+    def test_uniform_sign_fraction_anomalous(self, analyzer: WeightAnalyzer) -> None:
+        """Layers where all fractions are identical (low std) should score higher."""
+        # All layers have exactly 60% positive — systematically biased AND uniform
+        rng = np.random.default_rng(100)
+        weights = {}
+        for i in range(10):
+            arr = rng.standard_normal(100).astype(np.float32)
+            # Force exactly 60 positive values
+            arr = np.abs(arr)
+            arr[60:] *= -1
+            weights[f"layer{i}.weight"] = arr
+        score = analyzer.detect_gradient_sign_anomalies(weights)
+        assert score > 0.0
+
+
+# ---------------------------------------------------------------------------
+# analyze_layer_norm_statistics
+# ---------------------------------------------------------------------------
+
+
+class TestAnalyzeLayerNormStatistics:
+    def test_no_layernorm_returns_zero_score(self, analyzer: WeightAnalyzer) -> None:
+        """Weights with no LayerNorm layers should return anomaly_score=0."""
+        weights = {
+            "attention.weight": np.random.randn(64, 64).astype(np.float32),
+            "mlp.weight": np.random.randn(128, 64).astype(np.float32),
+        }
+        result = analyzer.analyze_layer_norm_statistics(weights)
+        assert result["anomaly_score"] == 0.0
+        assert result["n_layernorm_layers"] == 0
+
+    def test_normal_layernorm_not_flagged(self, analyzer: WeightAnalyzer) -> None:
+        """LayerNorm layers with similar norms should not be flagged."""
+        rng = np.random.default_rng(55)
+        weights = {
+            f"transformer.layer.{i}.attention.layer_norm.weight": (
+                rng.normal(1.0, 0.05, 64).astype(np.float32)
+            )
+            for i in range(12)
+        }
+        result = analyzer.analyze_layer_norm_statistics(weights)
+        assert result["n_extreme_total"] == 0
+        assert result["anomaly_score"] == 0.0
+
+    def test_extreme_layernorm_flagged(self, analyzer: WeightAnalyzer) -> None:
+        """A LayerNorm with an outlier norm should be flagged."""
+        rng = np.random.default_rng(66)
+        weights = {
+            f"transformer.layer.{i}.attention.layer_norm.weight": (
+                rng.normal(1.0, 0.05, 64).astype(np.float32)
+            )
+            for i in range(11)
+        }
+        # Inject an extreme outlier in one layer
+        weights["transformer.layer.11.attention.layer_norm.weight"] = (
+            np.ones(64, dtype=np.float32) * 1000.0
+        )
+        result = analyzer.analyze_layer_norm_statistics(weights)
+        assert result["n_extreme_total"] >= 1
+        assert result["anomaly_score"] > 0.0
+
+    def test_empty_weights_raises(self, analyzer: WeightAnalyzer) -> None:
+        with pytest.raises(ValueError, match="non-empty"):
+            analyzer.analyze_layer_norm_statistics({})
+
+    def test_returns_required_keys(self, analyzer: WeightAnalyzer) -> None:
+        weights = {
+            "layer_norm.weight": np.ones(64, dtype=np.float32),
+            "layer_norm2.weight": np.ones(64, dtype=np.float32) * 0.9,
+        }
+        result = analyzer.analyze_layer_norm_statistics(weights)
+        required = {
+            "n_layernorm_layers",
+            "extreme_gamma_layers",
+            "extreme_beta_layers",
+            "n_extreme_total",
+            "anomaly_score",
+            "notes",
+        }
+        assert required.issubset(set(result.keys()))
+
+    def test_score_in_range(self, analyzer: WeightAnalyzer) -> None:
+        rng = np.random.default_rng(77)
+        weights = {
+            f"layer_norm.{i}.weight": rng.normal(1.0, 0.1, 64).astype(np.float32)
+            for i in range(6)
+        }
+        result = analyzer.analyze_layer_norm_statistics(weights)
+        assert 0.0 <= result["anomaly_score"] <= 1.0
+
+    def test_beta_bias_detected(self, analyzer: WeightAnalyzer) -> None:
+        """Extreme beta (bias) parameters should also be flagged."""
+        rng = np.random.default_rng(88)
+        weights = {
+            f"layer_norm.{i}.bias": rng.normal(0.0, 0.05, 64).astype(np.float32)
+            for i in range(11)
+        }
+        # Inject one extreme bias layer
+        weights["layer_norm.11.bias"] = np.ones(64, dtype=np.float32) * 500.0
+        result = analyzer.analyze_layer_norm_statistics(weights)
+        assert result["n_extreme_total"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# build_summary
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSummary:
+    def test_returns_weight_summary(
+        self, analyzer: WeightAnalyzer, clean_weights: dict
+    ) -> None:
+        summary = analyzer.build_summary(clean_weights)
+        assert isinstance(summary, WeightSummary)
+
+    def test_n_layers_checked_correct(
+        self, analyzer: WeightAnalyzer, clean_weights: dict
+    ) -> None:
+        summary = analyzer.build_summary(clean_weights)
+        assert summary.n_layers_checked == len(clean_weights)
+
+    def test_score_in_range(
+        self, analyzer: WeightAnalyzer, clean_weights: dict
+    ) -> None:
+        summary = analyzer.build_summary(clean_weights)
+        assert 0.0 <= summary.overall_risk_score <= 1.0
+
+    def test_key_findings_is_list_of_strings(
+        self, analyzer: WeightAnalyzer, clean_weights: dict
+    ) -> None:
+        summary = analyzer.build_summary(clean_weights)
+        assert isinstance(summary.key_findings, list)
+        for kf in summary.key_findings:
+            assert isinstance(kf, str)
+
+    def test_suspicious_layers_is_list(
+        self, analyzer: WeightAnalyzer, clean_weights: dict
+    ) -> None:
+        summary = analyzer.build_summary(clean_weights)
+        assert isinstance(summary.suspicious_layers, list)
+
+    def test_empty_weights_raises(self, analyzer: WeightAnalyzer) -> None:
+        with pytest.raises(ValueError, match="non-empty"):
+            analyzer.build_summary({})
+
+    def test_backdoored_weights_higher_overall_score(
+        self,
+        analyzer: WeightAnalyzer,
+        clean_weights: dict,
+        backdoored_weights: dict,
+    ) -> None:
+        clean_summary = analyzer.build_summary(clean_weights)
+        backdoor_summary = analyzer.build_summary(backdoored_weights)
+        assert backdoor_summary.overall_risk_score >= clean_summary.overall_risk_score
+
+    def test_to_dict_has_all_keys(
+        self, analyzer: WeightAnalyzer, clean_weights: dict
+    ) -> None:
+        summary = analyzer.build_summary(clean_weights)
+        d = summary.to_dict()
+        required = {
+            "n_layers_checked",
+            "suspicious_layers",
+            "overall_risk_score",
+            "key_findings",
+            "gradient_sign_anomaly_score",
+            "layer_norm_extreme_count",
+        }
+        assert required.issubset(set(d.keys()))
+
+    def test_gradient_sign_score_in_range(
+        self, analyzer: WeightAnalyzer, clean_weights: dict
+    ) -> None:
+        summary = analyzer.build_summary(clean_weights)
+        assert 0.0 <= summary.gradient_sign_anomaly_score <= 1.0

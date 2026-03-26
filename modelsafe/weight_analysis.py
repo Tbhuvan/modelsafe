@@ -33,6 +33,48 @@ from scipy import stats  # type: ignore[import]
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# WeightSummary dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WeightSummary:
+    """Aggregated weight analysis result across all layers of a model.
+
+    Attributes:
+        n_layers_checked: Total number of weight tensors examined.
+        suspicious_layers: Names of layers with anomaly_score >= 0.5.
+        overall_risk_score: Aggregate risk score in [0, 1] (90th percentile
+            of per-layer scores, matching the WeightAnalyzer.analyze() formula).
+        key_findings: Human-readable summary bullets for the top anomalies.
+        gradient_sign_anomaly_score: Score from detect_gradient_sign_anomalies().
+        layer_norm_extreme_count: Number of LayerNorm layers with extreme
+            gamma/beta parameters.
+    """
+
+    n_layers_checked: int
+    suspicious_layers: list[str]
+    overall_risk_score: float
+    key_findings: list[str]
+    gradient_sign_anomaly_score: float = 0.0
+    layer_norm_extreme_count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise to plain dict.
+
+        Returns:
+            Dict representation of this WeightSummary.
+        """
+        return {
+            "n_layers_checked": self.n_layers_checked,
+            "suspicious_layers": self.suspicious_layers,
+            "overall_risk_score": round(self.overall_risk_score, 4),
+            "key_findings": self.key_findings,
+            "gradient_sign_anomaly_score": round(self.gradient_sign_anomaly_score, 4),
+            "layer_norm_extreme_count": self.layer_norm_extreme_count,
+        }
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -438,10 +480,307 @@ class WeightAnalyzer:
         z_score = (layer_norm - expected_norm) / expected_std
         return z_score > self.trojan_z_threshold
 
+    # ------------------------------------------------------------------
+    # New analysis methods
+    # ------------------------------------------------------------------
+
+    def detect_gradient_sign_anomalies(
+        self, weights: dict[str, np.ndarray]
+    ) -> float:
+        """Detect anomalous weight sign distributions across layers.
+
+        Backdoored models sometimes exhibit systematically biased sign
+        distributions in specific layers — a consequence of gradient-based
+        backdoor injection that preferentially shifts weights in one direction
+        (arXiv:2202.06196, Section 4.2).
+
+        The check works as follows:
+        1. For each weight tensor, compute the fraction of positive values.
+        2. Across all layers, collect those fractions.
+        3. A healthy model's layers should have ~50% positive values on average
+           with moderate variance.  Extreme global bias (mean fraction far from
+           0.5) or anomalously low variance (all layers uniformly shifted in
+           one direction) is suspicious.
+
+        Score interpretation:
+            0.0  — sign distribution indistinguishable from random initialisation.
+            1.0  — near-total sign uniformity across layers (highly anomalous).
+
+        Args:
+            weights: Dict mapping layer name to NumPy weight array.
+
+        Returns:
+            Anomaly score in [0.0, 1.0].
+
+        Raises:
+            ValueError: If weights dict is empty.
+        """
+        if not weights:
+            raise ValueError("weights must be non-empty")
+
+        positive_fractions: list[float] = []
+
+        for layer_name, tensor in weights.items():
+            arr = np.asarray(tensor, dtype=np.float64).flatten()
+            if arr.size < 4:
+                continue
+            frac_positive = float(np.mean(arr > 0))
+            positive_fractions.append(frac_positive)
+
+        if len(positive_fractions) < 2:
+            logger.debug("detect_gradient_sign_anomalies: too few layers, returning 0.0")
+            return 0.0
+
+        fractions = np.array(positive_fractions)
+        mean_frac = float(np.mean(fractions))
+        std_frac = float(np.std(fractions))
+
+        # Score component 1: global bias away from 0.5
+        # A shift of 0.5 (all positive or all negative) gives full score = 1.0
+        bias_score = min(1.0, abs(mean_frac - 0.5) / 0.5)
+
+        # Score component 2: anomalously LOW variance across layers
+        # Healthy models have std ~0.03–0.10 in sign fraction.
+        # Below 0.005 means every layer is uniformly shifted (suspicious).
+        uniformity_score = max(0.0, 1.0 - std_frac / 0.02) if std_frac < 0.02 else 0.0
+
+        # Combine: weight bias more heavily since it's a stronger signal
+        anomaly_score = float(np.clip(0.6 * bias_score + 0.4 * uniformity_score, 0.0, 1.0))
+
+        logger.debug(
+            "detect_gradient_sign_anomalies: mean_frac=%.3f std=%.3f score=%.3f",
+            mean_frac,
+            std_frac,
+            anomaly_score,
+        )
+        return round(anomaly_score, 4)
+
+    def analyze_layer_norm_statistics(
+        self, model_weights: dict[str, np.ndarray]
+    ) -> dict[str, Any]:
+        """Check LayerNorm gamma and beta parameters for extreme values.
+
+        Trigger-based backdoor attacks that operate through normalisation layers
+        (e.g., BadNorm, arXiv:2305.00465) embed the trigger in LayerNorm's
+        learned scale (gamma) and shift (beta) parameters.  Extreme values —
+        defined as more than 5 standard deviations from the distribution of
+        gamma/beta values across all LayerNorm layers — are flagged.
+
+        This check identifies:
+        - gamma parameters with |value| > 5σ above the cross-layer mean.
+        - beta parameters with |value| > 5σ above the cross-layer mean.
+        - Layers where the gamma distribution is unusually spiky (high kurtosis).
+
+        Args:
+            model_weights: Dict mapping layer name to NumPy array.  LayerNorm
+                layers are identified by name patterns containing
+                "layer_norm", "layernorm", or "ln_" (case-insensitive).
+
+        Returns:
+            Dict with keys:
+                n_layernorm_layers (int): Number of LayerNorm layers found.
+                extreme_gamma_layers (list[str]): Layers with extreme gamma.
+                extreme_beta_layers (list[str]): Layers with extreme beta.
+                n_extreme_total (int): Total count of extreme parameter layers.
+                anomaly_score (float): Combined anomaly score in [0, 1].
+                notes (list[str]): Human-readable explanation of findings.
+
+        Raises:
+            ValueError: If model_weights is empty.
+        """
+        if not model_weights:
+            raise ValueError("model_weights must be non-empty")
+
+        # Identify LayerNorm parameter tensors
+        _ln_patterns = re.compile(
+            r"(layer_?norm|ln_\d|ln_f|norm\d?)\.(weight|bias|gamma|beta)",
+            re.IGNORECASE,
+        )
+
+        gamma_layers: dict[str, np.ndarray] = {}
+        beta_layers: dict[str, np.ndarray] = {}
+
+        for name, tensor in model_weights.items():
+            lower = name.lower()
+            is_ln = bool(_ln_patterns.search(lower))
+            # Also catch plain "gamma" / "beta" keys inside norm layers
+            if not is_ln:
+                is_ln = any(
+                    pat in lower
+                    for pat in ("layer_norm", "layernorm", "ln_", "norm.weight", "norm.bias")
+                )
+            if not is_ln:
+                continue
+
+            arr = np.asarray(tensor, dtype=np.float64).flatten()
+            if "bias" in lower or "beta" in lower:
+                beta_layers[name] = arr
+            else:
+                gamma_layers[name] = arr
+
+        n_ln_layers = len(gamma_layers) + len(beta_layers)
+
+        if n_ln_layers == 0:
+            return {
+                "n_layernorm_layers": 0,
+                "extreme_gamma_layers": [],
+                "extreme_beta_layers": [],
+                "n_extreme_total": 0,
+                "anomaly_score": 0.0,
+                "notes": ["No LayerNorm layers detected in model weights."],
+            }
+
+        extreme_gamma: list[str] = []
+        extreme_beta: list[str] = []
+        notes: list[str] = []
+        _Z_EXTREME = 5.0
+
+        def _find_extreme_layers(
+            layers: dict[str, np.ndarray], param_name: str
+        ) -> list[str]:
+            """Return layer names whose parameters are >5 MAD-sigma from the median.
+
+            Uses the median and MAD (median absolute deviation) as robust
+            location/scale estimates so that a single outlier cannot inflate
+            the reference distribution and hide itself.
+            """
+            if len(layers) < 2:
+                return []
+
+            # Collect per-layer L-inf norms for cross-layer comparison
+            norms = {name: float(np.max(np.abs(arr))) for name, arr in layers.items()}
+            norm_values = np.array(list(norms.values()))
+            median_norm = float(np.median(norm_values))
+            # MAD: median(|x - median(x)|), scaled to match std for Gaussian data
+            mad = float(np.median(np.abs(norm_values - median_norm)))
+            robust_std = mad * 1.4826  # consistency factor for normal distribution
+
+            if robust_std < 1e-10:
+                return []
+
+            flagged: list[str] = []
+            for layer_name, norm_val in norms.items():
+                z = abs(norm_val - median_norm) / robust_std
+                if z > _Z_EXTREME:
+                    flagged.append(layer_name)
+                    notes.append(
+                        f"LayerNorm {param_name} '{layer_name}': "
+                        f"L-inf norm={norm_val:.4f}, robust-z={z:.2f} > {_Z_EXTREME} — "
+                        "possible backdoor trigger embedded in normalisation layer."
+                    )
+            return flagged
+
+        extreme_gamma = _find_extreme_layers(gamma_layers, "gamma/weight")
+        extreme_beta = _find_extreme_layers(beta_layers, "beta/bias")
+
+        n_extreme = len(extreme_gamma) + len(extreme_beta)
+
+        # Anomaly score: fraction of LayerNorm layers that are extreme
+        if n_ln_layers > 0:
+            raw_score = n_extreme / max(n_ln_layers, 1)
+            # Apply a multiplier: even 1 extreme layer in 100 is suspicious
+            anomaly_score = float(np.clip(raw_score * 3.0, 0.0, 1.0))
+        else:
+            anomaly_score = 0.0
+
+        if not notes:
+            notes.append(
+                f"All {n_ln_layers} LayerNorm parameter layers are within "
+                f"{_Z_EXTREME}σ of cross-layer mean."
+            )
+
+        return {
+            "n_layernorm_layers": n_ln_layers,
+            "extreme_gamma_layers": extreme_gamma,
+            "extreme_beta_layers": extreme_beta,
+            "n_extreme_total": n_extreme,
+            "anomaly_score": round(anomaly_score, 4),
+            "notes": notes,
+        }
+
+    def build_summary(self, model_weights: dict[str, np.ndarray]) -> WeightSummary:
+        """Run all checks and aggregate results into a WeightSummary.
+
+        Runs analyze(), detect_gradient_sign_anomalies(), and
+        analyze_layer_norm_statistics() and consolidates the findings into
+        a single structured result.
+
+        Args:
+            model_weights: Dict mapping layer name to NumPy weight array.
+
+        Returns:
+            WeightSummary with aggregated findings from all checks.
+
+        Raises:
+            ValueError: If model_weights is empty.
+        """
+        if not model_weights:
+            raise ValueError("model_weights must be non-empty")
+
+        # Core analysis
+        core = self.analyze(model_weights)
+        suspicious_layers = [
+            f["layer_name"]
+            for f in core["findings"]
+            if f.get("anomaly_score", 0.0) >= 0.5
+        ]
+
+        # Gradient sign anomalies
+        grad_sign_score = self.detect_gradient_sign_anomalies(model_weights)
+
+        # LayerNorm statistics
+        ln_result = self.analyze_layer_norm_statistics(model_weights)
+
+        # Build key findings
+        key_findings: list[str] = []
+
+        if core["n_flagged_layers"] > 0:
+            key_findings.append(
+                f"{core['n_flagged_layers']}/{core['n_layers_analysed']} layers "
+                f"have anomaly score >= 0.5 (weight distribution or spectral anomaly)."
+            )
+
+        if grad_sign_score >= 0.4:
+            key_findings.append(
+                f"Gradient sign anomaly score={grad_sign_score:.3f}: "
+                "weight sign distribution is unusually biased across layers."
+            )
+
+        if ln_result["n_extreme_total"] > 0:
+            key_findings.extend(ln_result["notes"])
+
+        if not key_findings:
+            key_findings.append(
+                f"All {core['n_layers_analysed']} layers passed weight checks. "
+                "No anomalous distributions, spectral outliers, or sign biases detected."
+            )
+
+        # Overall risk: combine core score with the new checks
+        overall = float(np.clip(
+            max(
+                core["anomaly_score"],
+                grad_sign_score * 0.5,
+                ln_result["anomaly_score"] * 0.6,
+            ),
+            0.0,
+            1.0,
+        ))
+
+        return WeightSummary(
+            n_layers_checked=core["n_layers_analysed"],
+            suspicious_layers=suspicious_layers,
+            overall_risk_score=round(overall, 4),
+            key_findings=key_findings,
+            gradient_sign_anomaly_score=grad_sign_score,
+            layer_norm_extreme_count=ln_result["n_extreme_total"],
+        )
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+import re  # noqa: E402 — imported here to avoid top-level import bloat
 
 
 def _score_to_severity(score: float) -> str:
