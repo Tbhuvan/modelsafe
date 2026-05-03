@@ -17,14 +17,15 @@
 
 ## Overview
 
-ModelSafe scans machine learning models for backdoors, data poisoning, and supply chain tampering — without requiring access to the original training data. It uses four training-data-free detection signals plus CVE correlation against known ML framework vulnerabilities:
+ModelSafe scans machine learning models for backdoors, data poisoning, and supply chain tampering — without requiring access to the original training data. It uses training-data-free detection signals plus CVE correlation against known ML framework vulnerabilities:
 
 1. **Spectral Weight Analysis** — Detects anomalous weight distributions indicative of trigger backdoors
 2. **Gradient Sign Anomaly Detection** — Identifies systematically biased weight sign distributions across layers
 3. **LayerNorm Statistics Analysis** — Catches extreme gamma/beta parameters that embed trigger patterns
 4. **Activation Distribution Analysis** — Identifies unusual activation patterns that suggest data poisoning
-5. **Provenance Verification** — Validates model metadata, checksums, and repository authenticity
-6. **CVE Correlation** — Surfaces relevant ML framework vulnerabilities for the model's architecture
+5. **Supply-Chain Code Backdoor Detection** — Flags active model-code hooks that read secrets, exfiltrate data, execute processes, or manipulate fine-tuning gradients
+6. **Provenance Verification** — Validates model metadata, checksums, and repository authenticity
+7. **CVE Correlation** — Surfaces relevant ML framework vulnerabilities for the model's architecture
 
 ## Threat Model
 
@@ -34,6 +35,7 @@ ModelSafe scans machine learning models for backdoors, data poisoning, and suppl
 | LayerNorm backdoors (BadNorm) | Extreme gamma/beta across layers | Cross-layer robust z-score (MAD-based) |
 | Gradient sign injection | Biased weight sign distribution | Cross-layer sign fraction analysis |
 | Data poisoning | Activation distribution shift | Kurtosis + variance on synthetic inputs |
+| Supply-chain code backdoor | Model code reads secrets, opens network channels, executes commands, or hooks gradients | Static scan of local `modeling_*.py` / model-code files |
 | Model impersonation | Provenance mismatch | Hash verification + metadata audit |
 | Framework vulnerabilities | CVE correlation | Built-in database of 10 ML CVEs |
 
@@ -60,7 +62,11 @@ modelsafe scan [model_id]
 |    -> HuggingFace Hub API: metadata, author, downloads               |
 |    -> Model card verification, author reputation, arch check         |
 |                                                                       |
-|  Step 3: WeightAnalyzer.analyze()                  [--skip-weight-   |
+|  Step 3: Supply-chain code backdoor scan                             |
+|    -> Static scan of local model-code files for secret access,       |
+|       network exfiltration, process execution, gradient hooks        |
+|                                                                       |
+|  Step 4: WeightAnalyzer.analyze()                  [--skip-weight-   |
 |    -> SVD analysis: energy concentration in top-k SVs   analysis]    |
 |    -> K-S test vs Gaussian baseline                                   |
 |    -> Layer norm Z-score heuristic for trojan triggers               |
@@ -68,15 +74,16 @@ modelsafe scan [model_id]
 |    -> analyze_layer_norm_statistics()                                 |
 |    -> build_summary() -> WeightSummary                               |
 |                                                                       |
-|  Step 4: ActivationScanner.scan()                  [--skip-          |
+|  Step 5: ActivationScanner.scan()                  [--skip-          |
 |    -> 100 synthetic text probes with PyTorch forward hooks  activation|
 |    -> Kurtosis + variance analysis per layer           -scan]        |
 |                                                                       |
-|  Step 5: CVECorrelator.correlate()                                    |
+|  Step 6: CVECorrelator.correlate()                                    |
 |    -> Built-in database of 10 ML framework CVEs                      |
 |    -> Architecture-aware matching (llama, bert, gpt2, ...)           |
 |                                                                       |
-|  Aggregate: risk_score = 0.3*prov + 0.4*weight + 0.3*activ           |
+|  Aggregate: risk_score = max(0.3*prov + 0.4*weight + 0.3*activ,      |
+|                              supply_chain_code_backdoor_score)       |
 +-----------------------------------------------------------------------+
         |
         v
@@ -346,6 +353,14 @@ pytest tests/ -q
   author={Yang, Jian and others},
   journal={arXiv:2409.09368},
   year={2024}
+}
+
+@article{li2026secret,
+  title={Secret Stealing Attacks on Local LLM Fine-Tuning through
+         Supply-Chain Model Code Backdoors},
+  author={Li, Zi and Zhou, Tian and Li, Wenze and Hua, Jingyu and Mao, Yunlong and Zhong, Sheng},
+  journal={arXiv:2604.27426},
+  year={2026}
 }
 
 @misc{owasp2023aisec,

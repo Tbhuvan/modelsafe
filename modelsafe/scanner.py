@@ -4,8 +4,9 @@ Main orchestrator for modelsafe model security scans.
 The scanner coordinates three independent security checks:
 
     1. Provenance check  — metadata, author reputation, model card, downloads.
-    2. Weight analysis   — spectral signatures, K-S test, Trojan norm heuristic.
-    3. Activation scan   — forward-pass probing with synthetic inputs.
+    2. Supply-chain model-code backdoor check — active execution/exfiltration hooks.
+    3. Weight analysis   — spectral signatures, K-S test, Trojan norm heuristic.
+    4. Activation scan   — forward-pass probing with synthetic inputs.
 
 Checks run in the order above.  The scanner short-circuits after the provenance
 check if the model matches a known threat hash (no need to download and analyse
@@ -21,6 +22,8 @@ A risk_score > 0.7 is reported as "unsafe".
 
 References:
     arXiv:2409.09368 — Models Are Codes
+    arXiv:2604.27426 — Secret Stealing Attacks on Local LLM Fine-Tuning
+        through Supply-Chain Model Code Backdoors
     OWASP AI Security Top 10 — ML05:2023 Supply Chain Vulnerabilities
 """
 
@@ -29,8 +32,10 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -49,6 +54,21 @@ _WEIGHT_PROVENANCE = 0.30
 _WEIGHT_WEIGHTS = 0.40
 _WEIGHT_ACTIVATION = 0.30
 _RISK_THRESHOLD = 0.70  # above this → unsafe
+
+_MODEL_CODE_FILE_PATTERNS = (
+    "modeling_*.py",
+    "configuration_*.py",
+    "tokenization_*.py",
+    "processing_*.py",
+    "*.py",
+)
+
+_CODE_BACKDOOR_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("secret_access", r"\b(os\.environ|os\.getenv|dotenv|API_KEY|TOKEN|SECRET|PASSWORD)\b"),
+    ("network_exfiltration", r"\b(requests\.(post|put|get)|httpx\.(post|put|get)|urllib\.request|socket\.)\b"),
+    ("process_execution", r"\b(subprocess\.|os\.system|eval\s*\(|exec\s*\(|compile\s*\()\b"),
+    ("gradient_hook", r"\b(register_(forward|backward)_hook|backward_hook|loss\.backward|gradient)\b"),
+)
 
 
 @dataclass
@@ -217,6 +237,7 @@ class ModelScanner:
         findings: list[dict[str, Any]] = []
         weight_anomaly_score = 0.0
         activation_anomaly_score = 0.0
+        code_backdoor_score = 0.0
         threat_db_hit = False
         threat_record: dict[str, Any] | None = None
 
@@ -272,13 +293,19 @@ class ModelScanner:
         # --- Step 3: Provenance check ---
         prov_score, prov_verified = self._run_provenance_check(model_id, findings)
 
-        # --- Step 4: Weight analysis ---
+        # --- Step 4: Supply-chain model-code backdoor check ---
+        if local_path:
+            code_backdoor_score = self._run_code_backdoor_check(
+                model_id, local_path, findings
+            )
+
+        # --- Step 5: Weight analysis ---
         if local_path:
             weight_anomaly_score = self._run_weight_analysis(
                 model_id, local_path, findings
             )
 
-        # --- Step 5: Activation scan ---
+        # --- Step 6: Activation scan ---
         if not self.skip_activation_scan and local_path:
             activation_anomaly_score = self._run_activation_scan(
                 model_id, local_path, findings
@@ -286,7 +313,10 @@ class ModelScanner:
 
         # --- Aggregate risk score ---
         risk_score = self._compute_risk_score(
-            prov_score, weight_anomaly_score, activation_anomaly_score
+            prov_score,
+            weight_anomaly_score,
+            activation_anomaly_score,
+            code_backdoor_score,
         )
 
         logger.info(
@@ -457,6 +487,43 @@ class ModelScanner:
 
         return score
 
+    def _run_code_backdoor_check(
+        self, model_id: str, local_path: str, findings: list[dict[str, Any]]
+    ) -> float:
+        """Scan local model code for supply-chain code backdoor indicators.
+
+        The category targets arXiv:2604.27426-style attacks where compromised
+        model code, disguised as normal architecture code, actively reads
+        secrets or manipulates fine-tuning execution.
+        """
+        detections = self._detect_supply_chain_code_backdoors(local_path)
+        if not detections:
+            findings.append({
+                "check": "supply_chain_code_backdoor",
+                "result": "PASS",
+                "severity": "info",
+                "detail": "No active model-code backdoor indicators found.",
+            })
+            return 0.0
+
+        categories = sorted({d["category"] for d in detections})
+        severity = "critical" if {
+            "secret_access",
+            "network_exfiltration",
+        }.issubset(categories) else "high"
+        score = 0.9 if severity == "critical" else 0.65
+        findings.append({
+            "check": "supply_chain_code_backdoor",
+            "result": "FAIL",
+            "severity": severity,
+            "detail": (
+                f"Model code in {model_id} contains suspicious categories "
+                f"{categories}; inspect files before local fine-tuning."
+            ),
+            "evidence": detections[:10],
+        })
+        return score
+
     def _run_activation_scan(
         self, model_id: str, local_path: str, findings: list[dict[str, Any]]
     ) -> float:
@@ -583,10 +650,44 @@ class ModelScanner:
         return weights
 
     @staticmethod
+    def _detect_supply_chain_code_backdoors(local_path: str) -> list[dict[str, Any]]:
+        """Return suspicious model-code indicators found under local_path."""
+        base = Path(local_path)
+        if not base.exists():
+            return []
+
+        candidates: list[Path] = []
+        if base.is_file() and base.suffix == ".py":
+            candidates = [base]
+        elif base.is_dir():
+            seen: set[Path] = set()
+            for pattern in _MODEL_CODE_FILE_PATTERNS:
+                for path in base.glob(pattern):
+                    if path.is_file() and path not in seen:
+                        candidates.append(path)
+                        seen.add(path)
+
+        detections: list[dict[str, Any]] = []
+        for path in candidates[:50]:
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for category, pattern in _CODE_BACKDOOR_PATTERNS:
+                if re.search(pattern, text, re.IGNORECASE | re.MULTILINE):
+                    detections.append({
+                        "file": str(path),
+                        "category": category,
+                        "pattern": pattern,
+                    })
+        return detections
+
+    @staticmethod
     def _compute_risk_score(
         prov_score: float,
         weight_score: float,
         activation_score: float,
+        code_backdoor_score: float = 0.0,
     ) -> float:
         """Compute the composite risk score.
 
@@ -594,6 +695,7 @@ class ModelScanner:
             prov_score: Provenance risk score [0, 1].
             weight_score: Weight anomaly score [0, 1].
             activation_score: Activation anomaly score [0, 1].
+            code_backdoor_score: Supply-chain code backdoor score [0, 1].
 
         Returns:
             Weighted average risk score in [0, 1].
@@ -603,6 +705,7 @@ class ModelScanner:
             + _WEIGHT_WEIGHTS * weight_score
             + _WEIGHT_ACTIVATION * activation_score
         )
+        score = max(score, code_backdoor_score)
         return float(np.clip(score, 0.0, 1.0))
 
     @staticmethod
